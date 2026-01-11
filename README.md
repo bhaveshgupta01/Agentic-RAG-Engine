@@ -45,3 +45,24 @@ python ingest.py
 
 # 4. Start the API Server
 python server.py
+
+```
+
+### Usage
+
+Send a POST request to the API:
+
+```bash
+curl -X POST "http://localhost:8000/chat" \
+     -H "Content-Type: application/json" \
+     -d '{"question": "What is Agentic RAG?", "thread_id": "user1"}'
+
+```
+
+## 🛠️ Tech Stack
+
+* **Graph Logic:** LangGraph
+* **LLM:** Mistral (Ollama)
+* **Vector DB:** ChromaDB
+* **Search:** DuckDuckGo
+* **API:** FastAPI
