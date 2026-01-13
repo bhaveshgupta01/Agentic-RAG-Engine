@@ -1,23 +1,47 @@
-from typing import TypedDict, List
-from langgraph.graph import StateGraph, END
-from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate
+import base64
+import os
+from typing import TypedDict, List, Literal, Optional
 from pydantic import BaseModel, Field
+
+# --- LANGCHAIN IMPORTS ---
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 from langchain_community.tools import DuckDuckGoSearchRun
+from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+
+# --- CONFIGURATION ---
+TEXT_MODEL = "mistral"
+VISION_MODEL = "llava" 
+EMBEDDING_MODEL = "nomic-embed-text"
+
+# --- HELPER: IMAGE ENCODER ---
+def encode_image(image_path):
+    if not os.path.exists(image_path):
+        return None
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        return None
 
 # 1. THE STATE
 class AgentState(TypedDict):
-    question: str           # The user's query
-    documents: List[str]    # Results from the vector DB
-    generation: str         # The LLM's final answer
-    web_search_needed: bool # A decision flag: Do we need Google?
+    question: str
+    documents: List[Document]
+    vision_analysis: str      
+    generation: str          
+    web_search_needed: bool
+    sources: List[str]        # We ensure this persists
+    retry_count: int          
 
 # --- LLM SETUP ---
-llm = ChatOllama(model="mistral", temperature=0)
+llm_text = ChatOllama(model=TEXT_MODEL, temperature=0)
+llm_vision = ChatOllama(model=VISION_MODEL, temperature=0)
 
 # 2. THE NODES
 
@@ -27,177 +51,197 @@ def retrieve(state: AgentState):
 
     vectorstore = Chroma(
         persist_directory="./chroma_db",
-        collection_name="rag-chroma",
-        embedding_function=OllamaEmbeddings(model="nomic-embed-text"),
-    )
-    
-    # Strict score threshold to avoid retrieving garbage
-    retriever = vectorstore.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={'k': 3, 'score_threshold': 0.3} 
+        collection_name="local-os-rag", 
+        embedding_function=OllamaEmbeddings(model=EMBEDDING_MODEL),
     )
     
     try:
-        documents = retriever.invoke(question)
+        # Boosted k to 6 to capture more potential images
+        retriever = vectorstore.as_retriever(search_kwargs={'k': 6})
+        docs = retriever.invoke(question)
     except:
-        documents = []
-    
-    print(f"\nDEBUG: User asked: '{question}'")
-    if not documents:
-        print("DEBUG: No documents met the similarity threshold.")
-    else:
-        for i, doc in enumerate(documents):
-            # FIX: Clean up whitespace for the log (removes the big gaps)
-            clean_content = doc.page_content.replace("\n", " ").strip()[:100]
-            print(f"DEBUG Doc {i}: {clean_content}...")
-    print("--------------------------------\n")
-    
-    doc_texts = [d.page_content for d in documents]
-    return {"documents": doc_texts, "question": question}
+        docs = []
 
-
-# --- GRADER CONFIG ---
-class GradeDocuments(BaseModel):
-    """Binary score for relevance check on retrieved documents."""
-    binary_score: str = Field(description="Documents are relevant to the user question, 'yes' or 'no'")
-    explanation: str = Field(description="A short explanation of why this document is relevant or not.")
-
-system_prompt = """You are a strict grader assessing relevance of a retrieved document to a user question.
-1. The document must contain the EXACT answer or specific semantic meaning to the question.
-2. If the user asks a "how to" or "what is" question, and the document is just a table of contents or a generic intro, grade it as 'no'.
-3. Do not grade 'yes' just because the document mentions the word 'question' or shared keywords. The MEANING must match.
-4. If you are unsure, grade it as 'no'.
-
-Give a binary score 'yes' or 'no' and a short explanation."""
-
-grade_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "Retrieved document: \n\n {document} \n\n User question: {question}"),
-    ]
-)
-
-structured_llm_grader = llm.with_structured_output(GradeDocuments)
-grader_chain = grade_prompt | structured_llm_grader
+    return {"documents": docs, "question": question, "retry_count": 0}
 
 def grade_documents(state: AgentState):
-    print("---GRADING DOCUMENTS---")
+    print("---GRADING RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
     
-    filtered_docs = []
+    class Grade(BaseModel):
+        score: str = Field(description="'yes' or 'no'")
     
-    for i, d in enumerate(documents):
-        # We pass the document string directly
-        score = grader_chain.invoke({"question": question, "document": d})
-        grade = score.binary_score
-        explanation = score.explanation
-        
-        print(f"\n   [DOC {i}]")
-        print(f"   Content: {d.replace('\n', ' ')[:80]}...") # Clean log here too
-        print(f"   Grade:   {grade}")
-        print(f"   Reason:  {explanation}")
-        
-        if grade == "yes":
-            filtered_docs.append(d)
-        
-    web_search_needed = False
-    if not filtered_docs:
-        web_search_needed = True
-        print("\n---DECISION: ALL DOCS BAD, SWITCHING TO WEB SEARCH---")
-    else:
-        print("\n---DECISION: DOCS GOOD, GENERATING---")
-        
-    return {"documents": filtered_docs, "web_search_needed": web_search_needed}
+    # We use a relaxed grader to let images pass through to Vision model
+    grader = llm_text.with_structured_output(Grade)
+    prompt = ChatPromptTemplate.from_template(
+        "Is this file likely to contain info about '{question}'? If it's an image file or relevant text, say yes. Doc: {doc}"
+    )
+    chain = prompt | grader
 
+    filtered_docs = []
+    sources = []
+    
+    for d in documents:
+        # If it's an image file path in the content/metadata, we almost always want to keep it to check
+        is_image = d.metadata.get('source', '').lower().endswith(('.jpg', '.png', '.jpeg'))
+        
+        try:
+            res = chain.invoke({"question": question, "doc": d.page_content})
+            if res.score == "yes" or is_image:
+                filtered_docs.append(d)
+                if 'source' in d.metadata:
+                    sources.append(d.metadata['source'])
+        except:
+            continue
+            
+    return {"documents": filtered_docs, "sources": list(set(sources))}
+
+def analyze_images_with_vision(state: AgentState):
+    sources = state.get("sources", [])
+    question = state["question"]
+    
+    print(f"---VISION ANALYSIS (Checking {len(sources)} images)---")
+    if not sources:
+        return {"vision_analysis": "No images found."}
+
+    vision_insights = []
+    for src in sources:
+        if src.lower().endswith(('.png', '.jpg', '.jpeg')):
+            print(f"   👀 Analyzing: {src}")
+            b64_img = encode_image(src)
+            if b64_img:
+                # UPDATED PROMPT: Explicitly ask to READ TEXT
+                msg = HumanMessage(
+                    content=[
+                        {"type": "text", "text": f"User Question: '{question}'. \nTASK: 1. Read any text visible in this image exactly. 2. Describe the visual layout. 3. Does this image answer the user?"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                    ]
+                )
+                response = llm_vision.invoke([msg])
+                vision_insights.append(f"Source: {src}\nAnalysis: {response.content}")
+    
+    return {"vision_analysis": "\n---\n".join(vision_insights)}
 
 def generate(state: AgentState):
     print("---GENERATING ANSWER---")
     question = state["question"]
-    documents = state["documents"]
+    vision_context = state.get("vision_analysis", "")
+    
+    # Combine context
+    final_context = f"VISUAL EVIDENCE:\n{vision_context}"
     
     prompt = ChatPromptTemplate.from_template(
-        """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.
+        """Answer the question based strictly on the Visual Evidence provided.
+        If the evidence mentions specific numbers, dates, or quotes, cite them.
         
-        Question: {question} 
-        Context: {context} 
+        Question: {question}
+        Evidence: {context}
         Answer:"""
     )
     
-    rag_chain = prompt | llm | StrOutputParser()
-    generation = rag_chain.invoke({"context": documents, "question": question})
-    return {"generation": generation}
+    chain = prompt | llm_text | StrOutputParser()
+    response = chain.invoke({"question": question, "context": final_context})
+    return {"generation": response}
 
+def check_quality(state: AgentState):
+    print("---QUALITY CONTROL---")
+    question = state["question"]
+    generation = state["generation"]
+    retry_count = state["retry_count"]
+    
+    class Quality(BaseModel):
+        score: str = Field(description="'good' or 'bad'")
+        reason: str = Field(description="Why?")
+
+    grader = llm_text.with_structured_output(Quality)
+    prompt = ChatPromptTemplate.from_template(
+        "User: {question}\nAgent: {generation}\nIs this a helpful, specific answer? 'good' or 'bad'?"
+    )
+    chain = prompt | grader
+    grade = chain.invoke({"question": question, "generation": generation})
+    
+    print(f"   Grade: {grade.score} ({grade.reason})")
+    
+    if grade.score == "good":
+        return "useful"
+    
+    # Logic: Retry once, then Web Search
+    if retry_count < 1:
+        return "retry"
+    return "web_search"
+
+def retry_generation(state: AgentState):
+    print("---RETRYING---")
+    return {"retry_count": state["retry_count"] + 1}
 
 def web_search(state: AgentState):
     print("---WEB SEARCHING---")
     question = state["question"]
-    search_tool = DuckDuckGoSearchRun()
-    search_results = search_tool.invoke(question)
-    return {"documents": [search_results]}
-
-
-# --- CONDITIONAL LOGIC (The Missing Piece!) ---
-def decide_next_step(state: AgentState):
-    if state["web_search_needed"]:
-        return "web_search"
-    else:
-        return "generate"
-
+    search = DuckDuckGoSearchRun()
+    result = search.invoke(question)
+    return {"vision_analysis": f"WEB RESULTS:\n{result}"} # Inject web results into context slot
 
 # 3. THE GRAPH
 workflow = StateGraph(AgentState)
 
 workflow.add_node("retrieve", retrieve)
 workflow.add_node("grade_documents", grade_documents)
+workflow.add_node("analyze_images", analyze_images_with_vision)
 workflow.add_node("generate", generate)
+workflow.add_node("retry_gen", retry_generation)
 workflow.add_node("web_search", web_search)
 
 workflow.set_entry_point("retrieve")
-
-# --- ADD THIS MISSING LINE ---
-workflow.add_edge("retrieve", "grade_documents") 
-# -----------------------------
+workflow.add_edge("retrieve", "grade_documents")
+workflow.add_edge("grade_documents", "analyze_images")
+workflow.add_edge("analyze_images", "generate")
 
 workflow.add_conditional_edges(
-    "grade_documents",
-    decide_next_step,
+    "generate",
+    check_quality,
     {
-        "web_search": "web_search",
-        "generate": "generate"
+        "useful": END,
+        "retry": "retry_gen",
+        "web_search": "web_search"
     }
 )
-
+workflow.add_edge("retry_gen", "generate")
 workflow.add_edge("web_search", "generate")
-workflow.add_edge("generate", END)
 
-# MEMORY SETUP
-memory = MemorySaver() 
-
-# COMPILE
+memory = MemorySaver()
 app = workflow.compile(checkpointer=memory)
 
 # 4. EXECUTION
 if __name__ == "__main__":
-    # We use a thread_id to track conversation history
-    thread = {"configurable": {"thread_id": "1"}}
+    thread = {"configurable": {"thread_id": "session_v4"}}
     
-    print("--- STARTING CONVERSATION ---")
+    print("=========================================")
+    print("   VISION-AGENTIC RAG v4.0               ")
+    print("=========================================")
     
-    # Question 1
-    inputs_1 = {"question": "What are the components of an autonomous agent?"}
-    for output in app.stream(inputs_1, config=thread):
+    query = input("\nAsk: ")
+    inputs = {"question": query}
+    
+    # Run the graph
+    for output in app.stream(inputs, config=thread):
         for key, value in output.items():
-            print(f"Finished Node: {key}")
-            if "generation" in value:
-                print(f"\nFINAL ANSWER: {value['generation']}\n")
+            print(f"Finished: {key}")
 
-    print("\n--- NEXT TURN (MEMORY CHECK) ---")
+    # --- FIX FOR DISPLAYING SOURCES ---
+    # We fetch the FINAL state from the memory, ensuring we have the complete picture
+    snapshot = app.get_state(thread)
+    final_state = snapshot.values
     
-    # Question 2 (Follow-up)
-    inputs_2 = {"question": "Explain the 'Memory' component you just mentioned."}
-    for output in app.stream(inputs_2, config=thread):
-        for key, value in output.items():
-            print(f"Finished Node: {key}")
-            if "generation" in value:
-                print(f"\nFINAL ANSWER: {value['generation']}\n")
+    print("\n" + "="*40)
+    print("💡 FINAL ANSWER:")
+    print("="*40)
+    print(final_state.get('generation', "No answer generated."))
+    
+    sources = final_state.get('sources', [])
+    if sources:
+        print("\n📸 REFERENCED IMAGES:")
+        for s in list(set(sources)):
+            print(f"   - {s}")
+    else:
+        print("\n(No local images used)")
